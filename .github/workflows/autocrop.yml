@@ -1,14 +1,13 @@
-name: Auto-crop image whitespace
+name: Convert PDF to Image
 
 on:
   push:
     paths:
-      - '**.jpg'
-      - '**.jpeg'
-      - '**.png'
+      - '**.pdf'
+  workflow_dispatch:
 
 jobs:
-  crop:
+  convert:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -21,47 +20,53 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Pillow
-        run: pip install Pillow
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils
+          pip install Pillow pdf2image
 
-      - name: Crop whitespace from images
+      - name: Convert PDFs to cropped images
         run: |
           python3 << 'EOF'
           import os
+          from pdf2image import convert_from_path
           from PIL import Image, ImageChops
 
+          STANDARD_WIDTH = 1100
+
+          def crop(img):
+              bg = Image.new(img.mode, img.size, img.getpixel((0, 0)))
+              diff = ImageChops.difference(img, bg)
+              bbox = diff.getbbox()
+              return img.crop(bbox) if bbox else img
+
           for root, dirs, files in os.walk('.'):
-              # skip .git folder
               if '.git' in root:
                   continue
               for filename in files:
-                  if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+                  if filename.lower().endswith('.pdf'):
                       filepath = os.path.join(root, filename)
+                      name = filename.replace('.pdf', '')
                       try:
-                          img = Image.open(filepath)
-                          rgb = img.convert('RGB')
-                          bg = Image.new('RGB', rgb.size, (255, 255, 255))
-                          diff = ImageChops.difference(rgb, bg)
-                          bbox = diff.getbbox()
-                          if bbox:
-                              left, top, right, bottom = bbox
-                              left = max(0, left - 5)
-                              top = max(0, top - 5)
-                              right = min(img.width, right + 5)
-                              bottom = min(img.height, bottom + 5)
-                              cropped = img.crop((left, top, right, bottom))
-                              cropped.save(filepath, quality=95)
-                              print(f'Cropped: {filepath}')
-                          else:
-                              print(f'No whitespace detected: {filepath}')
+                          pages = convert_from_path(filepath, dpi=150)
+                          for i, img in enumerate(pages):
+                              img = crop(img)
+                              w = STANDARD_WIDTH / img.size[0]
+                              h = int(img.size[1] * w)
+                              img = img.resize((STANDARD_WIDTH, h))
+                              out_name = f"{name}.jpg" if len(pages) == 1 else f"{name}_{i+1}.jpg"
+                              out_path = os.path.join(root, out_name)
+                              img.save(out_path, format="JPEG", quality=85)
+                              print(f'Created: {out_path}')
                       except Exception as e:
                           print(f'Error processing {filepath}: {e}')
           EOF
 
-      - name: Commit cropped images
+      - name: Commit generated images
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A -- '*.jpg' '*.jpeg' '*.png'
-          git diff --staged --quiet || git commit -m "Auto-crop image whitespace [skip ci]"
+          git add -A -- '*.jpg'
+          git diff --staged --quiet || git commit -m "Auto-convert PDF to cropped image [skip ci]"
           git push
