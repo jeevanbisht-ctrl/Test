@@ -1,4 +1,4 @@
-name: Convert PDF to Image
+name: Convert PDF to Image1
 
 on:
   push:
