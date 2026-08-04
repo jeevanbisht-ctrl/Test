@@ -1,0 +1,157 @@
+name: Convert PDF to Image
+
+on:
+  push:
+    paths:
+      - '**.pdf'
+  workflow_dispatch:  # allows manual trigger
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pdf-to-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils
+          pip install Pillow pdf2image
+
+      - name: Convert PDFs to images
+        id: convert
+        run: |
+          python3 << 'EOF'
+          import os
+          import sys
+          from pdf2image import convert_from_path
+          from PIL import Image, ImageChops
+
+          # ---- Configuration ----
+          STANDARD_WIDTH = 1100
+          DPI = 200
+          QUALITY = 95
+
+          def crop_image(img):
+              """Crop white/background margins based on top-left pixel colour."""
+              bg = Image.new(img.mode, img.size, img.getpixel((0, 0)))
+              diff = ImageChops.difference(img, bg)
+              bbox = diff.getbbox()
+              return img.crop(bbox) if bbox else img
+
+          # ---- Step 1: Find all PDFs ----
+          pdf_files = []
+          for root, _, files in os.walk('.'):
+              if '.git' in root:
+                  continue
+              for filename in files:
+                  if filename.lower().endswith('.pdf'):
+                      pdf_files.append(os.path.join(root, filename))
+
+          if not pdf_files:
+              print("No PDF files found.")
+              sys.exit(0)
+
+          # ---- Step 2: Delete ALL existing JPGs that might have come from PDFs ----
+          # We delete all .jpg files that reside in the same directories as PDFs,
+          # but we only remove those that match the naming pattern "<basename>.jpg"
+          # or "<basename>_*.jpg". This avoids deleting unrelated JPGs.
+          for pdf_path in pdf_files:
+              root = os.path.dirname(pdf_path)
+              base = os.path.splitext(os.path.basename(pdf_path))[0]   # e.g. "document"
+              # Build a set of expected prefixes
+              prefixes = [base, base + '_']   # exact match and underscore variant
+              if root == '':
+                  root = '.'
+              for f in os.listdir(root):
+                  if not f.lower().endswith('.jpg'):
+                      continue
+                  # Check if the file matches any expected pattern
+                  for prefix in prefixes:
+                      if f.startswith(prefix) and (len(f) == len(prefix) + 4 or f[len(prefix)] == '_'):
+                          # Matches: "document.jpg" or "document_1.jpg"
+                          full_path = os.path.join(root, f)
+                          os.remove(full_path)
+                          print(f'Deleted old: {full_path}')
+                          break   # avoid double removal
+
+          # ---- Step 3: Convert each PDF fresh ----
+          generated_files = []   # track files we create for git add
+          for pdf_path in pdf_files:
+              root = os.path.dirname(pdf_path)
+              base = os.path.splitext(os.path.basename(pdf_path))[0]
+              if root == '':
+                  root = '.'
+
+              try:
+                  pages = convert_from_path(pdf_path, dpi=DPI)
+                  for i, img in enumerate(pages):
+                      img = crop_image(img)
+                      # Resize preserving aspect ratio
+                      w = STANDARD_WIDTH / img.size[0]
+                      h = int(img.size[1] * w)
+                      img = img.resize((STANDARD_WIDTH, h), Image.Resampling.LANCZOS)
+
+                      # Determine output filename
+                      out_name = f"{base}.jpg" if len(pages) == 1 else f"{base}_{i+1}.jpg"
+                      out_path = os.path.join(root, out_name)
+                      img.save(out_path, format="JPEG", quality=QUALITY)
+                      generated_files.append(out_path)
+                      print(f'Created: {out_path}')
+              except Exception as e:
+                  print(f'Error processing {pdf_path}: {e}')
+                  # Optionally fail the job by exiting with non-zero
+                  sys.exit(1)
+
+          # Write the list of generated files to a file for later use
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"generated_files={' '.join(generated_files)}\n")
+          EOF
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Read the list of generated files from the previous step
+          IFS=' ' read -ra FILES <<< "${{ steps.convert.outputs.generated_files }}"
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "No new images were generated."
+            exit 0
+          fi
+
+          # Add only the files we actually created
+          git add "${FILES[@]}"
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          # Retry logic for pull/push
+          for i in {1..5}; do
+            git commit -m "Refresh cropped images [skip ci]"
+            git pull --rebase origin main
+            if git push; then
+              echo "Push succeeded"
+              break
+            else
+              echo "Push failed, retrying ($i/5)..."
+              sleep $((2**i + RANDOM % 5))
+            fi
+          done
