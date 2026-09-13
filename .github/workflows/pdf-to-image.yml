@@ -16,424 +16,97 @@ concurrency:
 jobs:
   convert:
     runs-on: ubuntu-latest
-
     steps:
-
-      # ============================================================
-      # 1. CHECKOUT
-      # ============================================================
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-
-      # ============================================================
-      # 2. SETUP PYTHON
-      # ============================================================
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-
-      # ============================================================
-      # 3. INSTALL PDF + IMAGE DEPENDENCIES
-      # ============================================================
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y poppler-utils
           pip install Pillow pdf2image
 
-
-      # ============================================================
-      # 4. CONVERT PDF → JPG + REMOVE WHITE SPACE
-      # ============================================================
-      - name: Convert PDFs to tightly cropped JPGs
+      - name: Delete old images and convert PDFs fresh
         run: |
-          python3 << 'PYTHON'
+          python3 << 'EOF'
           import os
           from pdf2image import convert_from_path
-          from PIL import Image, ImageChops, ImageOps, ImageFilter
-
-          # --------------------------------------------------------
-          # SETTINGS
-          # --------------------------------------------------------
+          from PIL import Image, ImageChops
 
           STANDARD_WIDTH = 1100
 
-          # Pixels with RGB values above this are considered
-          # background/white.
-          WHITE_THRESHOLD = 245
+          def crop(img):
+              bg = Image.new(img.mode, img.size, img.getpixel((0, 0)))
+              diff = ImageChops.difference(img, bg)
+              bbox = diff.getbbox()
+              return img.crop(bbox) if bbox else img
 
-          # Small safety margin around actual content.
-          CROP_MARGIN = 8
-
-
-          # --------------------------------------------------------
-          # FIND CONTENT AND CROP WHITE SPACE
-          # --------------------------------------------------------
-
-          def crop_whitespace(img):
-              """
-              Remove white / near-white space from all sides.
-
-              This is more reliable than comparing only against
-              the top-left pixel.
-              """
-
-              # Convert to RGB
-              img = img.convert("RGB")
-
-              # Convert to grayscale
-              gray = ImageOps.grayscale(img)
-
-              # Everything below WHITE_THRESHOLD becomes content.
-              # White / near-white becomes black background.
-              mask = gray.point(
-                  lambda p: 255 if p < WHITE_THRESHOLD else 0
-              )
-
-              # Remove tiny noise
-              mask = mask.filter(ImageFilter.MedianFilter(size=3))
-
-              bbox = mask.getbbox()
-
-              if not bbox:
-                  print("⚠️ No non-white content detected")
-                  return img
-
-              left, top, right, bottom = bbox
-
-              # Add a very small safety margin
-              left = max(0, left - CROP_MARGIN)
-              top = max(0, top - CROP_MARGIN)
-              right = min(img.width, right + CROP_MARGIN)
-              bottom = min(img.height, bottom + CROP_MARGIN)
-
-              cropped = img.crop(
-                  (left, top, right, bottom)
-              )
-
-              print(
-                  f"   Crop: "
-                  f"{img.width}x{img.height} "
-                  f"→ "
-                  f"{cropped.width}x{cropped.height}"
-              )
-
-              return cropped
-
-
-          # --------------------------------------------------------
-          # FIND ALL PDF FILES
-          # --------------------------------------------------------
-
+          # Step 1: find all PDFs and their expected output names first
           pdf_files = []
-
-          for root, dirs, files in os.walk("."):
-
-              # Ignore Git internals
-              dirs[:] = [
-                  d for d in dirs
-                  if d != ".git"
-              ]
-
+          for root, dirs, files in os.walk('.'):
+              if '.git' in root:
+                  continue
               for filename in files:
+                  if filename.lower().endswith('.pdf'):
+                      pdf_files.append(os.path.join(root, filename))
 
-                  if filename.lower().endswith(".pdf"):
-
-                      filepath = os.path.join(
-                          root,
-                          filename
-                      )
-
-                      pdf_files.append(filepath)
-
-
-          print("")
-          print("========================================")
-          print("PDF FILES FOUND")
-          print("========================================")
-
-          for pdf in pdf_files:
-              print(f"📄 {pdf}")
-
-          print("")
-          print(f"Total PDFs: {len(pdf_files)}")
-          print("")
-
-
-          # --------------------------------------------------------
-          # DELETE OLD JPG FILES
-          # --------------------------------------------------------
-
-          print("========================================")
-          print("DELETING OLD JPG FILES")
-          print("========================================")
-
+          # Step 2: delete any existing .jpg whose name matches a PDF we're about to regenerate
           for filepath in pdf_files:
-
               root = os.path.dirname(filepath)
-              name = os.path.splitext(
-                  os.path.basename(filepath)
-              )[0]
-
-              if not root:
-                  root = "."
-
-              for filename in os.listdir(root):
-
-                  # Delete normal JPG
-                  if filename.lower() == (
-                      name.lower() + ".jpg"
-                  ):
-
-                      old_path = os.path.join(
-                          root,
-                          filename
-                      )
-
+              name = os.path.basename(filepath).replace('.pdf', '')
+              for f in os.listdir(root or '.'):
+                  if f.startswith(name + '_') and f.lower().endswith('.jpg'):
+                      old_path = os.path.join(root, f)
                       os.remove(old_path)
-
-                      print(
-                          f"🗑️ Deleted old: {old_path}"
-                      )
-
-                  # Delete multi-page JPGs
-                  elif (
-                      filename.lower().startswith(
-                          name.lower() + "_"
-                      )
-                      and filename.lower().endswith(".jpg")
-                  ):
-
-                      old_path = os.path.join(
-                          root,
-                          filename
-                      )
-
+                      print(f'Deleted old: {old_path}')
+                  elif f == name + '.jpg':
+                      old_path = os.path.join(root, f)
                       os.remove(old_path)
+                      print(f'Deleted old: {old_path}')
 
-                      print(
-                          f"🗑️ Deleted old: {old_path}"
-                      )
-
-
-          # --------------------------------------------------------
-          # CONVERT EACH PDF
-          # --------------------------------------------------------
-
-          print("")
-          print("========================================")
-          print("CONVERTING PDF → JPG")
-          print("========================================")
-
-
+          # Step 3: convert each PDF fresh
           for filepath in pdf_files:
-
               root = os.path.dirname(filepath)
-
-              if not root:
-                  root = "."
-
-              name = os.path.splitext(
-                  os.path.basename(filepath)
-              )[0]
-
-              print("")
-              print(f"📄 Processing: {filepath}")
-
+              name = os.path.basename(filepath).replace('.pdf', '')
               try:
-
-                  # Convert PDF to images
-                  pages = convert_from_path(
-                      filepath,
-                      dpi=150
-                  )
-
-                  print(
-                      f"   Pages detected: {len(pages)}"
-                  )
-
-
-                  # ------------------------------------------------
-                  # PROCESS EACH PAGE
-                  # ------------------------------------------------
-
+                  pages = convert_from_path(filepath, dpi=150)
                   for i, img in enumerate(pages):
-
-                      print(
-                          f"   Processing page {i + 1}"
-                      )
-
-                      # Remove white space
-                      img = crop_whitespace(img)
-
-                      # ------------------------------------------------
-                      # RESIZE
-                      # ------------------------------------------------
-
-                      original_width = img.width
-                      original_height = img.height
-
-                      if original_width <= 0:
-                          print(
-                              "⚠️ Invalid image width"
-                          )
-                          continue
-
-                      ratio = (
-                          STANDARD_WIDTH /
-                          original_width
-                      )
-
-                      new_height = max(
-                          1,
-                          int(
-                              original_height *
-                              ratio
-                          )
-                      )
-
-                      img = img.resize(
-                          (
-                              STANDARD_WIDTH,
-                              new_height
-                          ),
-                          Image.Resampling.LANCZOS
-                      )
-
-
-                      # ------------------------------------------------
-                      # OUTPUT NAME
-                      # ------------------------------------------------
-
-                      if len(pages) == 1:
-
-                          out_name = (
-                              f"{name}.jpg"
-                          )
-
-                      else:
-
-                          out_name = (
-                              f"{name}_{i + 1}.jpg"
-                          )
-
-
-                      out_path = os.path.join(
-                          root,
-                          out_name
-                      )
-
-
-                      # ------------------------------------------------
-                      # SAVE JPG
-                      # ------------------------------------------------
-
-                      img.save(
-                          out_path,
-                          format="JPEG",
-                          quality=90,
-                          optimize=True
-                      )
-
-                      print(
-                          f"   ✅ Created: {out_path}"
-                      )
-
-                      print(
-                          f"      Size: "
-                          f"{img.width}x{img.height}"
-                      )
-
-
+                      img = crop(img)
+                      w = STANDARD_WIDTH / img.size[0]
+                      h = int(img.size[1] * w)
+                      img = img.resize((STANDARD_WIDTH, h))
+                      out_name = f"{name}.jpg" if len(pages) == 1 else f"{name}_{i+1}.jpg"
+                      out_path = os.path.join(root, out_name)
+                      img.save(out_path, format="JPEG", quality=85)
+                      print(f'Created: {out_path}')
               except Exception as e:
+                  print(f'Error processing {filepath}: {e}')
+          EOF
 
-                  print(
-                      f"❌ Error processing "
-                      f"{filepath}: {e}"
-                  )
-
-
-          print("")
-          print("========================================")
-          print("CONVERSION COMPLETE")
-          print("========================================")
-
-
-      # ============================================================
-      # 5. SHOW GENERATED FILES
-      # ============================================================
-      - name: Show generated JPG files
-        run: |
-          echo "Generated JPG files:"
-          find . -type f -iname "*.jpg" -print
-
-
-      # ============================================================
-      # 6. COMMIT JPG FILES
-      # ============================================================
-      - name: Commit generated JPG files
+      - name: Commit changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git add -A -- '*.jpg'
-
-          if git diff --cached --quiet; then
-            echo "ℹ️ Nothing to commit"
-            exit 0
-          fi
-
-          git commit -m "Refresh cropped images [skip ci]"
-
-
-      # ============================================================
-      # 7. PUSH WITH RETRY
-      # ============================================================
-      - name: Push JPG changes
-        run: |
-          for i in 1 2 3 4 5
-          do
-            echo ""
-            echo "========================================"
-            echo "Push attempt $i/5"
-            echo "========================================"
-
-            git fetch origin main
-
-            if ! git rebase origin/main; then
-              echo "⚠️ Rebase failed"
-
-              git rebase --abort || true
-
-              echo "⏳ Waiting 5 seconds..."
+          for i in 1 2 3 4 5; do
+            git add -A -- '*.jpg'
+            if git diff --staged --quiet; then
+              echo "Nothing to commit"
+              break
+            fi
+            git commit -m "Refresh cropped images [skip ci]"
+            git pull --rebase origin main
+            if git push; then
+              echo "Push succeeded"
+              break
+            else
+              echo "Push failed, retrying ($i/5)..."
               sleep 5
-              continue
-            fi
-
-            if git push origin HEAD:main; then
-              echo ""
-              echo "========================================"
-              echo "✅ PUSH SUCCESSFUL"
-              echo "========================================"
-              exit 0
-            fi
-
-            echo "⚠️ Push failed"
-
-            if [ "$i" -lt 5 ]; then
-              echo "⏳ Waiting 10 seconds before retry..."
-              sleep 10
             fi
           done
-
-          echo ""
-          echo "========================================"
-          echo "❌ PUSH FAILED AFTER 5 ATTEMPTS"
-          echo "========================================"
-
-          exit 1
